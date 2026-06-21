@@ -85,3 +85,27 @@ export interface VehicleInfo {
   lastSpeed: number;
   lastUpdate: number;
 }
+
+export interface TrajectorySegment {
+  vehicleId: string;
+  type: VehicleType;
+  points: GPSPoint[];
+  startTime: number;
+  endTime: number;
+}
+
+export interface SimilarTrajectoryResult {
+  vehicleId: string;
+  type: VehicleType;
+  distance: number;
+  similarity: number;
+  points: GPSPoint[];
+  startTime: number;
+  endTime: number;
+}
+
+export interface TrajectorySearchRequest {
+  queryPoints: GPSPoint[];
+  topK?: number;
+  vehicleType?: VehicleType | 'all';
+}

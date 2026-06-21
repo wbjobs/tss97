@@ -1,5 +1,7 @@
 import { Router } from 'express';
 import { store } from '../store';
+import { searchSimilarTrajectories } from '../services/trajectorySearch';
+import type { GPSPoint } from '../../shared/types';
 
 const router = Router();
 
@@ -53,6 +55,24 @@ router.get('/stats', (_req, res) => {
     shipCount: vehicles.filter((v) => v.type === 'ship').length,
     totalPoints: store.getTotalPoints(),
   });
+});
+
+router.post('/trajectory/search', (req, res) => {
+  try {
+    const { queryPoints, topK, vehicleType } = req.body;
+    if (!Array.isArray(queryPoints) || queryPoints.length < 2) {
+      return res.status(400).json({ error: 'queryPoints must have at least 2 points' });
+    }
+    const results = searchSimilarTrajectories(
+      queryPoints as GPSPoint[],
+      topK ?? 10,
+      vehicleType ?? 'all',
+    );
+    res.json({ results });
+  } catch (err) {
+    console.error('[API] Trajectory search error:', err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
 });
 
 export default router;

@@ -1,4 +1,4 @@
-import { Activity, Car, Ship, Radio, RadioTower, Play, Pause, RotateCcw } from 'lucide-react';
+import { Activity, Car, Ship, RadioTower, Play, Pause, RotateCcw, Search, X } from 'lucide-react';
 import { useTrackingStore, ViewMode } from '../store/tracking';
 
 export default function ControlBar() {
@@ -13,6 +13,12 @@ export default function ControlBar() {
     stats,
     anomalies,
     clearAll,
+    isSearchMode,
+    toggleSearchMode,
+    isSelecting,
+    queryPoints,
+    similarResults,
+    setShowComparison,
   } = useTrackingStore();
 
   const modes: Array<{ id: ViewMode; label: string }> = [
@@ -86,6 +92,28 @@ export default function ControlBar() {
         <RotateCcw size={12} />
         清空
       </button>
+
+      <button
+        onClick={toggleSearchMode}
+        className={`flex items-center gap-1 px-2.5 py-1 text-xs font-mono rounded border transition-all ${
+          isSearchMode
+            ? 'bg-[#ff6b35]/20 text-[#ff6b35] border-[#ff6b35]/50 shadow-[0_0_8px_rgba(255,107,53,0.3)]'
+            : 'text-[#64748b] hover:text-[#ff6b35] border-[#1e293b] hover:border-[#ff6b35]/40'
+        }`}
+      >
+        {isSearchMode ? <X size={12} /> : <Search size={12} />}
+        {isSearchMode ? '退出搜索' : '轨迹搜索'}
+      </button>
+
+      {similarResults.length > 0 && (
+        <button
+          onClick={() => setShowComparison(!useTrackingStore.getState().showComparison)}
+          className="flex items-center gap-1 px-2.5 py-1 text-xs font-mono text-[#00f5d4] rounded border border-[#00f5d4]/50 bg-[#00f5d4]/10 hover:bg-[#00f5d4]/20 transition-all"
+        >
+          <Search size={12} />
+          Top{similarResults.length} 相似轨迹
+        </button>
+      )}
 
       <div className="flex-1" />
 

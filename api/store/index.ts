@@ -77,6 +77,25 @@ export class RingBufferStore {
   getTotalPoints(): number {
     return this.buffer.length;
   }
+
+  getAllVehicleTrails(limitPerVehicle = 500): Map<string, GPSPoint[]> {
+    const result = new Map<string, GPSPoint[]>();
+    for (let i = this.buffer.length - 1; i >= 0; i--) {
+      const p = this.buffer[i];
+      let arr = result.get(p.vehicleId);
+      if (!arr) {
+        arr = [];
+        result.set(p.vehicleId, arr);
+      }
+      if (arr.length < limitPerVehicle) {
+        arr.unshift(p);
+      }
+      if (result.size >= this.vehicles.size && Array.from(result.values()).every((a) => a.length >= limitPerVehicle)) {
+        break;
+      }
+    }
+    return result;
+  }
 }
 
 export const store = new RingBufferStore();

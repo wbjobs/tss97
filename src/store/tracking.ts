@@ -5,6 +5,7 @@ import type {
   Cluster,
   AnomalyPoint,
   VehicleInfo,
+  SimilarTrajectoryResult,
 } from '../../shared/types';
 
 export type ViewMode = 'realtime' | 'playback';
@@ -23,6 +24,13 @@ interface TrackingState {
   fps: number;
   filterType: 'all' | 'taxi' | 'ship';
 
+  isSearchMode: boolean;
+  isSelecting: boolean;
+  queryPoints: GPSPoint[];
+  similarResults: SimilarTrajectoryResult[];
+  isSearching: boolean;
+  showComparison: boolean;
+
   setViewMode: (mode: ViewMode) => void;
   setFilterType: (type: 'all' | 'taxi' | 'ship') => void;
   addPoints: (points: GPSPoint[]) => void;
@@ -35,6 +43,14 @@ interface TrackingState {
   setThroughput: (rate: number) => void;
   setFps: (fps: number) => void;
   clearAll: () => void;
+
+  toggleSearchMode: () => void;
+  setIsSelecting: (v: boolean) => void;
+  setQueryPoints: (points: GPSPoint[]) => void;
+  setSimilarResults: (results: SimilarTrajectoryResult[]) => void;
+  setIsSearching: (v: boolean) => void;
+  setShowComparison: (v: boolean) => void;
+  clearSearch: () => void;
 }
 
 export const useTrackingStore = create<TrackingState>((set, get) => ({
@@ -50,6 +66,13 @@ export const useTrackingStore = create<TrackingState>((set, get) => ({
   throughput: 0,
   fps: 0,
   filterType: 'all',
+
+  isSearchMode: false,
+  isSelecting: false,
+  queryPoints: [],
+  similarResults: [],
+  isSearching: false,
+  showComparison: false,
 
   setViewMode: (mode) => set({ viewMode: mode }),
   setFilterType: (type) => set({ filterType: type }),
@@ -96,5 +119,28 @@ export const useTrackingStore = create<TrackingState>((set, get) => ({
       points: [],
       vehicleTrails: new Map(),
       selectedVehicleId: null,
+    }),
+
+  toggleSearchMode: () => {
+    const cur = get().isSearchMode;
+    set({
+      isSearchMode: !cur,
+      isSelecting: false,
+      queryPoints: [],
+      similarResults: [],
+      showComparison: false,
+    });
+  },
+  setIsSelecting: (v) => set({ isSelecting: v }),
+  setQueryPoints: (points) => set({ queryPoints: points }),
+  setSimilarResults: (results) => set({ similarResults: results }),
+  setIsSearching: (v) => set({ isSearching: v }),
+  setShowComparison: (v) => set({ showComparison: v }),
+  clearSearch: () =>
+    set({
+      queryPoints: [],
+      similarResults: [],
+      isSearching: false,
+      showComparison: false,
     }),
 }));

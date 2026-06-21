@@ -1,7 +1,7 @@
-import { useEffect, useRef } from 'react';
+import { useEffect, useRef, useCallback } from 'react';
 import L from 'leaflet';
 import { useTrackingStore } from '../store/tracking';
-import type { GPSPoint, Cluster, AnomalyPoint } from '../../shared/types';
+import type { GPSPoint, Cluster, AnomalyPoint, SimilarTrajectoryResult } from '../../shared/types';
 import 'leaflet/dist/leaflet.css';
 
 const SHANGHAI_CENTER: [number, number] = [31.2304, 121.4737];
@@ -22,13 +22,25 @@ function rgbaFromHex(hex: string, alpha: number): string {
   return `rgba(${r},${g},${b},${alpha})`;
 }
 
+const COMPARE_COLORS = [
+  '#ff6b35',
+  '#00f5d4',
+  '#f59e0b',
+  '#a855f7',
+  '#22c55e',
+  '#3b82f6',
+  '#ec4899',
+  '#14b8a6',
+  '#f97316',
+  '#8b5cf6',
+];
+
 export default function TrackMap() {
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const pulsePhaseRef = useRef<number>(0);
   const rafRef = useRef<number>(0);
-  const lastRenderTimeRef = useRef<number>(0);
 
   const {
     vehicleTrails,
@@ -38,7 +50,36 @@ export default function TrackMap() {
     filterType,
     selectedVehicleId,
     selectVehicle,
+    isSearchMode,
+    queryPoints,
+    similarResults,
+    showComparison,
   } = useTrackingStore();
+
+  const performSearch = useCallback(async (queryPts: GPSPoint[]) => {
+    const { setIsSearching, setSimilarResults, setShowComparison } = useTrackingStore.getState();
+    setIsSearching(true);
+    try {
+      const res = await fetch('/api/trajectory/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          queryPoints: queryPts,
+          topK: 10,
+          vehicleType: 'all',
+        }),
+      });
+      const data = await res.json();
+      if (data.results) {
+        setSimilarResults(data.results);
+        setShowComparison(true);
+      }
+    } catch (err) {
+      console.error('Search failed:', err);
+    } finally {
+      setIsSearching(false);
+    }
+  }, []);
 
   useEffect(() => {
     if (!mapRef.current || mapInstanceRef.current) return;
@@ -122,7 +163,52 @@ export default function TrackMap() {
       return result;
     };
 
-    const render = (t: number) => {
+    const drawTrail = (
+      context: CanvasRenderingContext2D,
+      points: GPSPoint[],
+      color: string,
+      alpha: number,
+      width: number,
+      step: number,
+      project: (lat: number, lng: number) => { x: number; y: number },
+      useSpeedColor = false,
+      type: 'taxi' | 'ship' = 'taxi',
+    ) => {
+      const simplified = simplifyPoints(points, step);
+      const len = simplified.length;
+      if (len < 2) return;
+
+      context.lineWidth = width;
+      context.lineCap = 'round';
+      context.lineJoin = 'round';
+
+      if (useSpeedColor) {
+        let start = project(simplified[0].lat, simplified[0].lng);
+        for (let i = 1; i < len; i++) {
+          const cur = simplified[i];
+          const end = project(cur.lat, cur.lng);
+          const c = getVehicleColor(type, cur.speed);
+          context.strokeStyle = rgbaFromHex(c, alpha);
+          context.beginPath();
+          context.moveTo(start.x, start.y);
+          context.lineTo(end.x, end.y);
+          context.stroke();
+          start = end;
+        }
+      } else {
+        context.strokeStyle = rgbaFromHex(color, alpha);
+        context.beginPath();
+        const first = project(simplified[0].lat, simplified[0].lng);
+        context.moveTo(first.x, first.y);
+        for (let i = 1; i < len; i++) {
+          const p = project(simplified[i].lat, simplified[i].lng);
+          context.lineTo(p.x, p.y);
+        }
+        context.stroke();
+      }
+    };
+
+    const render = () => {
       const canvasEl = canvasRef.current;
       const mapInst = mapInstanceRef.current;
       if (!canvasEl || !mapInst) return;
@@ -152,20 +238,9 @@ export default function TrackMap() {
       pulsePhaseRef.current += 0.04;
       const pulse = (Math.sin(pulsePhaseRef.current) + 1) * 0.5;
 
-      const trails: Array<{
-        id: string;
-        type: 'taxi' | 'ship';
-        points: GPSPoint[];
-      }> = [];
-      vehicleTrails.forEach((trail, id) => {
-        const first = trail[0];
-        if (!first) return;
-        if (filterType !== 'all' && first.type !== filterType) return;
-        if (trail.length < 2) return;
-        trails.push({ id, type: first.type, points: trail });
-      });
+      const inCompareMode = showComparison && similarResults.length > 0;
 
-      if (stats?.heatmapGrid && stats.heatmapGrid.length > 0) {
+      if (!inCompareMode && stats?.heatmapGrid && stats.heatmapGrid.length > 0) {
         for (const h of stats.heatmapGrid) {
           if (!isVisible(h.lat, h.lng, 0.01)) continue;
           const { x, y } = project(h.lat, h.lng);
@@ -182,33 +257,74 @@ export default function TrackMap() {
         }
       }
 
-      for (const trail of trails) {
-        const simplified = simplifyPoints(trail.points, step);
-        const len = simplified.length;
-        if (len < 2) continue;
+      if (inCompareMode) {
+        similarResults.forEach((result: SimilarTrajectoryResult, idx: number) => {
+          const color = COMPARE_COLORS[idx % COMPARE_COLORS.length];
+          const pts = result.points.filter(
+            (p) => isVisible(p.lat, p.lng, 0.005),
+          );
+          drawTrail(context, pts, color, 0.85, 2.5, Math.max(1, Math.floor(step / 2)), project);
+        });
+      } else {
+        const trails: Array<{
+          id: string;
+          type: 'taxi' | 'ship';
+          points: GPSPoint[];
+        }> = [];
+        vehicleTrails.forEach((trail, id) => {
+          const first = trail[0];
+          if (!first) return;
+          if (filterType !== 'all' && first.type !== filterType) return;
+          if (trail.length < 2) return;
+          trails.push({ id, type: first.type, points: trail });
+        });
 
-        const faded = selectedVehicleId && selectedVehicleId !== trail.id;
-        const baseAlpha = faded ? 0.15 : 0.75;
-
-        context.lineWidth = 2;
-        context.lineCap = 'round';
-        context.lineJoin = 'round';
-
-        let start = project(simplified[0].lat, simplified[0].lng);
-        for (let i = 1; i < len; i++) {
-          const cur = simplified[i];
-          const end = project(cur.lat, cur.lng);
-          const color = getVehicleColor(trail.type, cur.speed);
-          context.strokeStyle = rgbaFromHex(color, baseAlpha);
-          context.beginPath();
-          context.moveTo(start.x, start.y);
-          context.lineTo(end.x, end.y);
-          context.stroke();
-          start = end;
+        for (const trail of trails) {
+          const faded = selectedVehicleId && selectedVehicleId !== trail.id;
+          const baseAlpha = faded ? 0.15 : 0.75;
+          const visiblePts = trail.points.filter(
+            (p) => isVisible(p.lat, p.lng, 0.005),
+          );
+          if (visiblePts.length < 2) continue;
+          drawTrail(
+            context,
+            visiblePts,
+            '',
+            baseAlpha,
+            2,
+            step,
+            project,
+            true,
+            trail.type,
+          );
         }
       }
 
-      if (clusters && clusters.length > 0) {
+      if (queryPoints.length > 1 && isSearchMode) {
+        const visPts = queryPoints.filter((p) => isVisible(p.lat, p.lng, 0.005));
+        drawTrail(context, visPts, '#ff6b35', 1, 3.5, 1, project);
+        if (visPts.length > 0) {
+          const first = project(visPts[0].lat, visPts[0].lng);
+          context.fillStyle = '#22c55e';
+          context.beginPath();
+          context.arc(first.x, first.y, 6, 0, Math.PI * 2);
+          context.fill();
+          context.strokeStyle = '#fff';
+          context.lineWidth = 2;
+          context.stroke();
+
+          const last = project(visPts[visPts.length - 1].lat, visPts[visPts.length - 1].lng);
+          context.fillStyle = '#ef4444';
+          context.beginPath();
+          context.arc(last.x, last.y, 6, 0, Math.PI * 2);
+          context.fill();
+          context.strokeStyle = '#fff';
+          context.lineWidth = 2;
+          context.stroke();
+        }
+      }
+
+      if (clusters && clusters.length > 0 && !inCompareMode) {
         for (const c of clusters) {
           if (!isVisible(c.centerLat, c.centerLng, 0.005)) continue;
           const { x, y } = project(c.centerLat, c.centerLng);
@@ -235,7 +351,7 @@ export default function TrackMap() {
         }
       }
 
-      if (anomalies && anomalies.length > 0) {
+      if (anomalies && anomalies.length > 0 && !inCompareMode) {
         for (const a of anomalies) {
           if (!isVisible(a.lat, a.lng, 0.003)) continue;
           const { x, y } = project(a.lat, a.lng);
@@ -259,45 +375,76 @@ export default function TrackMap() {
         }
       }
 
-      const markerData: (GPSPoint & { x: number; y: number })[] = [];
-      vehicleTrails.forEach((trail) => {
-        const last = trail[trail.length - 1];
-        if (!last) return;
-        if (filterType !== 'all' && last.type !== filterType) return;
-        if (!isVisible(last.lat, last.lng, 0.003)) return;
-        const { x, y } = project(last.lat, last.lng);
-        markerData.push({ ...last, x, y });
-      });
+      if (!inCompareMode) {
+        const markerData: (GPSPoint & { x: number; y: number })[] = [];
+        vehicleTrails.forEach((trail) => {
+          const last = trail[trail.length - 1];
+          if (!last) return;
+          if (filterType !== 'all' && last.type !== filterType) return;
+          if (!isVisible(last.lat, last.lng, 0.003)) return;
+          const { x, y } = project(last.lat, last.lng);
+          markerData.push({ ...last, x, y });
+        });
 
-      for (const d of markerData) {
-        const faded = selectedVehicleId && selectedVehicleId !== d.vehicleId;
-        const markerAlpha = faded ? 0.3 : 1;
-        const color = getVehicleColor(d.type, d.speed);
-        const pulseR = 6 + pulse * 5;
+        for (const d of markerData) {
+          const faded = selectedVehicleId && selectedVehicleId !== d.vehicleId;
+          const markerAlpha = faded ? 0.3 : 1;
+          const color = getVehicleColor(d.type, d.speed);
+          const pulseR = 6 + pulse * 5;
 
-        context.strokeStyle = rgbaFromHex(color, markerAlpha * 0.6);
-        context.lineWidth = 2;
-        context.beginPath();
-        context.arc(d.x, d.y, pulseR, 0, Math.PI * 2);
-        context.stroke();
+          context.strokeStyle = rgbaFromHex(color, markerAlpha * 0.6);
+          context.lineWidth = 2;
+          context.beginPath();
+          context.arc(d.x, d.y, pulseR, 0, Math.PI * 2);
+          context.stroke();
 
-        context.fillStyle = rgbaFromHex(color, markerAlpha);
-        context.strokeStyle = 'rgba(10,14,26,0.9)';
-        context.lineWidth = 1.5;
-        context.beginPath();
-        context.arc(d.x, d.y, 5, 0, Math.PI * 2);
-        context.fill();
-        context.stroke();
+          context.fillStyle = rgbaFromHex(color, markerAlpha);
+          context.strokeStyle = 'rgba(10,14,26,0.9)';
+          context.lineWidth = 1.5;
+          context.beginPath();
+          context.arc(d.x, d.y, 5, 0, Math.PI * 2);
+          context.fill();
+          context.stroke();
 
-        context.font = '12px sans-serif';
-        context.textAlign = 'center';
-        context.textBaseline = 'middle';
-        context.globalAlpha = markerAlpha;
-        context.fillText(d.type === 'taxi' ? '🚕' : '🚢', d.x, d.y + 1);
-        context.globalAlpha = 1;
+          context.font = '12px sans-serif';
+          context.textAlign = 'center';
+          context.textBaseline = 'middle';
+          context.globalAlpha = markerAlpha;
+          context.fillText(d.type === 'taxi' ? '🚕' : '🚢', d.x, d.y + 1);
+          context.globalAlpha = 1;
+        }
+      } else {
+        similarResults.forEach((result: SimilarTrajectoryResult, idx: number) => {
+          const pts = result.points;
+          if (pts.length === 0) return;
+          const last = pts[pts.length - 1];
+          if (!isVisible(last.lat, last.lng, 0.003)) return;
+          const { x, y } = project(last.lat, last.lng);
+          const color = COMPARE_COLORS[idx % COMPARE_COLORS.length];
+          const pulseR = 7 + pulse * 4;
+
+          context.strokeStyle = rgbaFromHex(color, 0.7);
+          context.lineWidth = 2;
+          context.beginPath();
+          context.arc(x, y, pulseR, 0, Math.PI * 2);
+          context.stroke();
+
+          context.fillStyle = color;
+          context.strokeStyle = 'rgba(10,14,26,0.9)';
+          context.lineWidth = 1.5;
+          context.beginPath();
+          context.arc(x, y, 6, 0, Math.PI * 2);
+          context.fill();
+          context.stroke();
+
+          context.fillStyle = '#fff';
+          context.font = 'bold 10px JetBrains Mono, monospace';
+          context.textAlign = 'center';
+          context.textBaseline = 'middle';
+          context.fillText(`${idx + 1}`, x, y);
+        });
       }
 
-      lastRenderTimeRef.current = t;
       rafRef.current = requestAnimationFrame(render);
     };
 
@@ -326,22 +473,74 @@ export default function TrackMap() {
 
     const clickHandler = (e: MouseEvent) => {
       const hit = hitTest(e.clientX, e.clientY);
-      if (hit) {
+      if (isSearchMode) {
+        let targetVehicle = hit?.vehicleId;
+        if (!targetVehicle) {
+          const mapInst = mapInstanceRef.current;
+          if (mapInst) {
+            const rect = canvas.getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            let minDist = Infinity;
+            vehicleTrails.forEach((trail, vid) => {
+              const last = trail[trail.length - 1];
+              if (!last) return;
+              if (filterType !== 'all' && last.type !== filterType) return;
+              const p = mapInst.latLngToContainerPoint([last.lat, last.lng]);
+              const dist = Math.sqrt((p.x - x) ** 2 + (p.y - y) ** 2);
+              if (dist < minDist) {
+                minDist = dist;
+                targetVehicle = vid;
+              }
+            });
+          }
+        }
+        if (targetVehicle) {
+          const trail = vehicleTrails.get(targetVehicle);
+          if (trail && trail.length > 5) {
+            useTrackingStore.getState().setQueryPoints(trail.slice());
+            performSearch(trail.slice());
+          }
+        }
+      } else if (hit) {
         selectVehicle(selectedVehicleId === hit.vehicleId ? null : hit.vehicleId);
       }
     };
     canvas.addEventListener('click', clickHandler);
 
+    if (canvas) {
+      canvas.style.cursor = isSearchMode ? 'crosshair' : 'pointer';
+    }
+
     return () => {
       cancelAnimationFrame(rafRef.current);
       canvas.removeEventListener('click', clickHandler);
     };
-  }, [vehicleTrails, stats, clusters, anomalies, filterType, selectedVehicleId, selectVehicle]);
+  }, [
+    vehicleTrails,
+    stats,
+    clusters,
+    anomalies,
+    filterType,
+    selectedVehicleId,
+    selectVehicle,
+    isSearchMode,
+    queryPoints,
+    similarResults,
+    showComparison,
+    performSearch,
+  ]);
 
   return (
     <div
       ref={mapRef}
-      className="w-full h-full bg-[#0a0e1a]"
-    />
+      className="w-full h-full bg-[#0a0e1a] relative"
+    >
+      {isSearchMode && (
+        <div className="absolute top-3 left-3 z-[1000] px-3 py-2 bg-[#ff6b35]/20 border border-[#ff6b35]/50 rounded text-xs font-mono text-[#ff6b35] backdrop-blur-sm">
+          🔍 轨迹搜索模式：点击车辆以选择查询轨迹
+        </div>
+      )}
+    </div>
   );
 }
