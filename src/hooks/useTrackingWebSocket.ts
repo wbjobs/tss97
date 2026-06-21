@@ -2,39 +2,69 @@ import { useEffect, useRef, useCallback } from 'react';
 import { useTrackingStore } from '../store/tracking';
 import type { GPSPoint, WSMessage, StatsData, HeatmapCell, SpeedBin } from '../../shared/types';
 
+const MAIN_HISTOGRAM = new Array(12).fill(0);
+const MAIN_HEATMAP = new Map<
+  string,
+  { lat: number; lng: number; count: number; lastSeen: number }
+>();
+let MAIN_WINDOW_START = Date.now();
+
 function computeStatsMainThread(points: GPSPoint[]): StatsData {
   const HISTOGRAM_BINS = 12;
   const MAX_SPEED = 120;
   const BIN_SIZE = MAX_SPEED / HISTOGRAM_BINS;
+  const HEAT_PRECISION = 3;
+  const HEAT_WINDOW_MS = 5 * 60 * 1000;
 
-  const speedBins = new Array(HISTOGRAM_BINS).fill(0);
+  const now = Date.now();
+
+  if (now - MAIN_WINDOW_START > 60_000) {
+    for (let i = 0; i < MAIN_HISTOGRAM.length; i++) {
+      MAIN_HISTOGRAM[i] = Math.floor(MAIN_HISTOGRAM[i] * 0.5);
+    }
+    MAIN_WINDOW_START = now;
+  }
+
   const vehicleIds = new Set<string>();
-  const grid = new Map<string, { lat: number; lng: number; count: number }>();
-  const PRECISION = 3;
 
   for (const p of points) {
     vehicleIds.add(p.vehicleId);
     const binIdx = Math.min(HISTOGRAM_BINS - 1, Math.floor(p.speed / BIN_SIZE));
-    speedBins[binIdx]++;
+    MAIN_HISTOGRAM[binIdx]++;
 
-    const key = `${p.lat.toFixed(PRECISION)}_${p.lng.toFixed(PRECISION)}`;
-    const cell = grid.get(key);
+    const key = `${p.lat.toFixed(HEAT_PRECISION)}_${p.lng.toFixed(HEAT_PRECISION)}`;
+    const cell = MAIN_HEATMAP.get(key);
     if (cell) {
       cell.count++;
+      cell.lastSeen = now;
     } else {
-      grid.set(key, { lat: p.lat, lng: p.lng, count: 1 });
+      MAIN_HEATMAP.set(key, {
+        lat: parseFloat(p.lat.toFixed(HEAT_PRECISION)),
+        lng: parseFloat(p.lng.toFixed(HEAT_PRECISION)),
+        count: 1,
+        lastSeen: now,
+      });
     }
   }
 
-  const histogram: SpeedBin[] = speedBins.map((count, i) => ({
+  const cutoff = now - HEAT_WINDOW_MS;
+  for (const [key, cell] of MAIN_HEATMAP) {
+    if (cell.lastSeen < cutoff) {
+      const ageFactor = Math.max(0, 1 - (cutoff - cell.lastSeen) / HEAT_WINDOW_MS);
+      cell.count = Math.floor(cell.count * ageFactor);
+      if (cell.count <= 0) MAIN_HEATMAP.delete(key);
+    }
+  }
+
+  const histogram: SpeedBin[] = MAIN_HISTOGRAM.map((count, i) => ({
     bin: i * BIN_SIZE,
     count,
   }));
 
-  const arr = Array.from(grid.values())
+  const arr = Array.from(MAIN_HEATMAP.values())
     .sort((a, b) => b.count - a.count)
     .slice(0, 200);
-  const maxCount = arr.length > 0 ? arr[0].count : 1;
+  const maxCount = arr.length > 0 ? Math.max(1, arr[0].count) : 1;
   const heatmap: HeatmapCell[] = arr.map((c) => ({
     lat: c.lat,
     lng: c.lng,

@@ -1,6 +1,5 @@
 import { useEffect, useRef } from 'react';
 import L from 'leaflet';
-import * as d3 from 'd3';
 import { useTrackingStore } from '../store/tracking';
 import type { GPSPoint, Cluster, AnomalyPoint } from '../../shared/types';
 import 'leaflet/dist/leaflet.css';
@@ -15,16 +14,21 @@ function getVehicleColor(type: 'taxi' | 'ship', speed: number): string {
   return '#00f5d4';
 }
 
+function rgbaFromHex(hex: string, alpha: number): string {
+  const h = hex.replace('#', '');
+  const r = parseInt(h.substring(0, 2), 16);
+  const g = parseInt(h.substring(2, 4), 16);
+  const b = parseInt(h.substring(4, 6), 16);
+  return `rgba(${r},${g},${b},${alpha})`;
+}
+
 export default function TrackMap() {
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
-  const svgLayerRef = useRef<SVGSVGElement | null>(null);
-  const trailsGroupRef = useRef<SVGGElement | null>(null);
-  const markersGroupRef = useRef<SVGGElement | null>(null);
-  const heatmapGroupRef = useRef<SVGGElement | null>(null);
-  const clustersGroupRef = useRef<SVGGElement | null>(null);
-  const anomaliesGroupRef = useRef<SVGGElement | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const pulsePhaseRef = useRef<number>(0);
   const rafRef = useRef<number>(0);
+  const lastRenderTimeRef = useRef<number>(0);
 
   const {
     vehicleTrails,
@@ -46,7 +50,7 @@ export default function TrackMap() {
       maxZoom: 16,
       zoomControl: true,
       attributionControl: false,
-      preferCanvas: false,
+      preferCanvas: true,
     });
 
     L.tileLayer(
@@ -57,29 +61,36 @@ export default function TrackMap() {
       },
     ).addTo(map);
 
-    const svgLayer = L.svg({ pane: 'overlayPane' });
-    svgLayer.addTo(map);
+    const canvasPane = map.createPane('canvasPane');
+    canvasPane.style.zIndex = '450';
+    canvasPane.style.pointerEvents = 'none';
 
-    const svg = d3.select(map.getPane('overlayPane')).select('svg');
-    svg.attr('pointer-events', 'auto');
+    const canvas = document.createElement('canvas');
+    canvas.style.position = 'absolute';
+    canvas.style.top = '0';
+    canvas.style.left = '0';
+    canvas.style.pointerEvents = 'auto';
+    canvasPane.appendChild(canvas);
+    canvasRef.current = canvas;
 
-    const gRoot = svg.append('g').attr('class', 'leaflet-zoom-hide');
-    const trailsGroup = gRoot.append('g').attr('class', 'trails');
-    const heatmapGroup = gRoot.append('g').attr('class', 'heatmap');
-    const clustersGroup = gRoot.append('g').attr('class', 'clusters');
-    const anomaliesGroup = gRoot.append('g').attr('class', 'anomalies');
-    const markersGroup = gRoot.append('g').attr('class', 'markers');
-
-    svgLayerRef.current = svg.node() as SVGSVGElement | null;
-    trailsGroupRef.current = trailsGroup.node() as SVGGElement | null;
-    markersGroupRef.current = markersGroup.node() as SVGGElement | null;
-    heatmapGroupRef.current = heatmapGroup.node() as SVGGElement | null;
-    clustersGroupRef.current = clustersGroup.node() as SVGGElement | null;
-    anomaliesGroupRef.current = anomaliesGroup.node() as SVGGElement | null;
+    const resizeCanvas = () => {
+      if (!canvasRef.current) return;
+      const size = map.getSize();
+      const dpr = window.devicePixelRatio || 1;
+      canvasRef.current.width = size.x * dpr;
+      canvasRef.current.height = size.y * dpr;
+      canvasRef.current.style.width = `${size.x}px`;
+      canvasRef.current.style.height = `${size.y}px`;
+      const ctx = canvasRef.current.getContext('2d');
+      if (ctx) ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    };
+    resizeCanvas();
+    map.on('resize', resizeCanvas);
     mapInstanceRef.current = map;
 
     return () => {
       cancelAnimationFrame(rafRef.current);
+      map.off('resize', resizeCanvas);
       map.remove();
       mapInstanceRef.current = null;
     };
@@ -87,32 +98,59 @@ export default function TrackMap() {
 
   useEffect(() => {
     const map = mapInstanceRef.current;
-    if (!map) return;
+    const canvas = canvasRef.current;
+    if (!map || !canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
 
-    const projectPoint = (lat: number, lng: number): [number, number] => {
-      const p = map.latLngToLayerPoint([lat, lng]);
-      return [p.x, p.y];
+    const getStepByZoom = (zoom: number): number => {
+      if (zoom < 11) return 8;
+      if (zoom < 12) return 5;
+      if (zoom < 13) return 3;
+      if (zoom < 14) return 2;
+      return 1;
     };
 
-    const render = () => {
-      if (!mapInstanceRef.current) return;
+    const simplifyPoints = (pts: GPSPoint[], step: number): GPSPoint[] => {
+      if (step <= 1 || pts.length < 5) return pts;
+      const result: GPSPoint[] = [];
+      for (let i = 0; i < pts.length; i += step) {
+        result.push(pts[i]);
+      }
+      const last = pts[pts.length - 1];
+      if (result[result.length - 1] !== last) result.push(last);
+      return result;
+    };
 
-      const trailsG = d3.select(trailsGroupRef.current!);
-      const markersG = d3.select(markersGroupRef.current!);
-      const heatmapG = d3.select(heatmapGroupRef.current!);
-      const clustersG = d3.select(clustersGroupRef.current!);
-      const anomaliesG = d3.select(anomaliesGroupRef.current!);
+    const render = (t: number) => {
+      const canvasEl = canvasRef.current;
+      const mapInst = mapInstanceRef.current;
+      if (!canvasEl || !mapInst) return;
+      const context = canvasEl.getContext('2d');
+      if (!context) return;
 
-      const topLeft = projectPoint(
-        mapInstanceRef.current.getBounds().getNorthWest().lat,
-        mapInstanceRef.current.getBounds().getNorthWest().lng,
-      );
+      const size = mapInst.getSize();
+      context.clearRect(0, 0, size.x, size.y);
 
-      trailsG.attr('transform', `translate(${-topLeft[0]},${-topLeft[1]})`);
-      markersG.attr('transform', `translate(${-topLeft[0]},${-topLeft[1]})`);
-      heatmapG.attr('transform', `translate(${-topLeft[0]},${-topLeft[1]})`);
-      clustersG.attr('transform', `translate(${-topLeft[0]},${-topLeft[1]})`);
-      anomaliesG.attr('transform', `translate(${-topLeft[0]},${-topLeft[1]})`);
+      const bounds = mapInst.getBounds();
+      const minLat = bounds.getSouth();
+      const maxLat = bounds.getNorth();
+      const minLng = bounds.getWest();
+      const maxLng = bounds.getEast();
+
+      const isVisible = (lat: number, lng: number, pad = 0.005): boolean =>
+        lat >= minLat - pad && lat <= maxLat + pad &&
+        lng >= minLng - pad && lng <= maxLng + pad;
+
+      const project = (lat: number, lng: number): { x: number; y: number } => {
+        const p = mapInst.latLngToContainerPoint([lat, lng]);
+        return { x: p.x, y: p.y };
+      };
+
+      const zoom = mapInst.getZoom();
+      const step = getStepByZoom(zoom);
+      pulsePhaseRef.current += 0.04;
+      const pulse = (Math.sin(pulsePhaseRef.current) + 1) * 0.5;
 
       const trails: Array<{
         id: string;
@@ -127,252 +165,176 @@ export default function TrackMap() {
         trails.push({ id, type: first.type, points: trail });
       });
 
-      const lineFunc = d3
-        .line<GPSPoint>()
-        .x((d) => projectPoint(d.lat, d.lng)[0])
-        .y((d) => projectPoint(d.lat, d.lng)[1])
-        .curve(d3.curveBasis);
-
-      const trailPaths = trailsG
-        .selectAll<SVGPathElement, (typeof trails)[0]>('path.trail')
-        .data(trails, (d) => d.id);
-
-      trailPaths
-        .enter()
-        .append('path')
-        .attr('class', 'trail')
-        .attr('fill', 'none')
-        .attr('stroke-width', 2)
-        .attr('stroke-linecap', 'round')
-        .attr('stroke-linejoin', 'round')
-        .attr('opacity', (d) =>
-          selectedVehicleId && selectedVehicleId !== d.id ? 0.15 : 0.7,
-        )
-        .attr('stroke', (d) => {
-          const last = d.points[d.points.length - 1];
-          return getVehicleColor(d.type, last?.speed || 0);
-        })
-        .merge(trailPaths)
-        .attr('d', (d) => lineFunc(d.points))
-        .attr('opacity', (d) =>
-          selectedVehicleId && selectedVehicleId !== d.id ? 0.15 : 0.7,
-        )
-        .attr('stroke', (d) => {
-          const last = d.points[d.points.length - 1];
-          return getVehicleColor(d.type, last?.speed || 0);
-        });
-
-      trailPaths.exit().remove();
-
-      const markerData: GPSPoint[] = [];
-      vehicleTrails.forEach((trail) => {
-        const last = trail[trail.length - 1];
-        if (last) {
-          if (filterType === 'all' || last.type === filterType) {
-            markerData.push(last);
-          }
+      if (stats?.heatmapGrid && stats.heatmapGrid.length > 0) {
+        for (const h of stats.heatmapGrid) {
+          if (!isVisible(h.lat, h.lng, 0.01)) continue;
+          const { x, y } = project(h.lat, h.lng);
+          const r = 30;
+          const grad = context.createRadialGradient(x, y, 0, x, y, r);
+          const alpha = h.intensity * 0.28;
+          grad.addColorStop(0, `rgba(255,107,53,${alpha})`);
+          grad.addColorStop(0.4, `rgba(245,158,11,${alpha * 0.6})`);
+          grad.addColorStop(1, 'rgba(0,245,212,0)');
+          context.fillStyle = grad;
+          context.beginPath();
+          context.arc(x, y, r, 0, Math.PI * 2);
+          context.fill();
         }
-      });
+      }
 
-      const markers = markersG
-        .selectAll<SVGGElement, GPSPoint>('g.vehicle-marker')
-        .data(markerData, (d) => d.vehicleId);
+      for (const trail of trails) {
+        const simplified = simplifyPoints(trail.points, step);
+        const len = simplified.length;
+        if (len < 2) continue;
 
-      const markersEnter = markers
-        .enter()
-        .append('g')
-        .attr('class', 'vehicle-marker')
-        .style('cursor', 'pointer')
-        .on('click', (_, d) => {
-          selectVehicle(
-            selectedVehicleId === d.vehicleId ? null : d.vehicleId,
-          );
-        });
+        const faded = selectedVehicleId && selectedVehicleId !== trail.id;
+        const baseAlpha = faded ? 0.15 : 0.75;
 
-      markersEnter
-        .append('circle')
-        .attr('class', 'pulse')
-        .attr('r', 6)
-        .attr('fill', 'none')
-        .attr('stroke', (d) => getVehicleColor(d.type, d.speed))
-        .attr('stroke-width', 2)
-        .attr('opacity', 0.8);
+        context.lineWidth = 2;
+        context.lineCap = 'round';
+        context.lineJoin = 'round';
 
-      markersEnter
-        .append('circle')
-        .attr('r', 5)
-        .attr('stroke', '#0a0e1a')
-        .attr('stroke-width', 1.5)
-        .attr('fill', (d) => getVehicleColor(d.type, d.speed));
-
-      markersEnter
-        .append('text')
-        .text((d) => (d.type === 'taxi' ? '🚕' : '🚢'))
-        .attr('font-size', 12)
-        .attr('text-anchor', 'middle')
-        .attr('dominant-baseline', 'middle')
-        .attr('y', 1)
-        .style('pointer-events', 'none');
-
-      markers
-        .merge(markersEnter as unknown as d3.Selection<
-          SVGGElement,
-          GPSPoint,
-          SVGGElement,
-          unknown
-        >)
-        .attr(
-          'transform',
-          (d) =>
-            `translate(${projectPoint(d.lat, d.lng)[0]},${projectPoint(d.lat, d.lng)[1]})`,
-        )
-        .attr('opacity', (d) =>
-          selectedVehicleId && selectedVehicleId !== d.vehicleId ? 0.3 : 1,
-        );
-
-      markers.exit().remove();
-
-      if (stats?.heatmapGrid) {
-        const heatPts = stats.heatmapGrid
-          .map((h) => {
-            const [x, y] = projectPoint(h.lat, h.lng);
-            return { ...h, x, y };
-          })
-          .filter(
-            (h) =>
-              h.x > -50 &&
-              h.y > -50 &&
-              h.x < mapInstanceRef.current!.getSize().x + 50 &&
-              h.y < mapInstanceRef.current!.getSize().y + 50,
-          );
-
-        const heatCircles = heatmapG
-          .selectAll<SVGCircleElement, (typeof heatPts)[0]>('circle.heat')
-          .data(heatPts, (d, i) => `${d.lat}-${d.lng}-${i}`);
-
-        heatCircles
-          .enter()
-          .append('circle')
-          .attr('class', 'heat')
-          .attr('r', 40)
-          .attr('fill', 'url(#heatGradient)')
-          .merge(heatCircles)
-          .attr('cx', (d) => d.x)
-          .attr('cy', (d) => d.y)
-          .attr('opacity', (d) => d.intensity * 0.35);
-
-        heatCircles.exit().remove();
-
-        let defs = d3.select(svgLayerRef.current!).select<SVGDefsElement>('defs');
-        if (defs.empty()) {
-          defs = d3.select(svgLayerRef.current!).append('defs');
-          const grad = defs
-            .append('radialGradient')
-            .attr('id', 'heatGradient');
-          grad.append('stop').attr('offset', '0%').attr('stop-color', '#ff6b35').attr('stop-opacity', 0.9);
-          grad.append('stop').attr('offset', '40%').attr('stop-color', '#f59e0b').attr('stop-opacity', 0.5);
-          grad.append('stop').attr('offset', '100%').attr('stop-color', '#00f5d4').attr('stop-opacity', 0);
+        let start = project(simplified[0].lat, simplified[0].lng);
+        for (let i = 1; i < len; i++) {
+          const cur = simplified[i];
+          const end = project(cur.lat, cur.lng);
+          const color = getVehicleColor(trail.type, cur.speed);
+          context.strokeStyle = rgbaFromHex(color, baseAlpha);
+          context.beginPath();
+          context.moveTo(start.x, start.y);
+          context.lineTo(end.x, end.y);
+          context.stroke();
+          start = end;
         }
       }
 
       if (clusters && clusters.length > 0) {
-        const clustersProjected = clusters.map((c) => {
-          const [x, y] = projectPoint(c.centerLat, c.centerLng);
-          return { ...c, x, y };
-        });
+        for (const c of clusters) {
+          if (!isVisible(c.centerLat, c.centerLng, 0.005)) continue;
+          const { x, y } = project(c.centerLat, c.centerLng);
+          const r = 15 + Math.min(30, c.pointCount / 5);
 
-        const clusterSel = clustersG
-          .selectAll<SVGGElement, (typeof clustersProjected)[0]>('g.cluster')
-          .data(clustersProjected, (d) => d.id);
+          context.strokeStyle = 'rgba(0,245,212,0.9)';
+          context.lineWidth = 2;
+          context.setLineDash([4, 3]);
+          context.beginPath();
+          context.arc(x, y, r, 0, Math.PI * 2);
+          context.stroke();
+          context.setLineDash([]);
 
-        const clusterEnter = clusterSel.enter().append('g').attr('class', 'cluster');
+          context.fillStyle = 'rgba(0,245,212,0.12)';
+          context.beginPath();
+          context.arc(x, y, r, 0, Math.PI * 2);
+          context.fill();
 
-        clusterEnter
-          .append('circle')
-          .attr('fill', '#00f5d4')
-          .attr('fill-opacity', 0.15)
-          .attr('stroke', '#00f5d4')
-          .attr('stroke-width', 2)
-          .attr('stroke-dasharray', '4 3');
-
-        clusterEnter
-          .append('text')
-          .attr('fill', '#00f5d4')
-          .attr('font-family', 'JetBrains Mono, monospace')
-          .attr('font-size', 10)
-          .attr('font-weight', 'bold')
-          .attr('text-anchor', 'middle')
-          .attr('dominant-baseline', 'middle');
-
-        clusterSel
-          .merge(clusterEnter)
-          .attr('transform', (d) => `translate(${d.x},${d.y})`)
-          .select('circle')
-          .attr('r', (d) => 15 + Math.min(30, d.pointCount / 5));
-
-        clusterSel
-          .merge(clusterEnter)
-          .select('text')
-          .text((d) => `${d.vehicleIds.length}车`);
-
-        clusterSel.exit().remove();
-      } else {
-        clustersG.selectAll('g.cluster').remove();
+          context.fillStyle = '#00f5d4';
+          context.font = 'bold 10px JetBrains Mono, monospace';
+          context.textAlign = 'center';
+          context.textBaseline = 'middle';
+          context.fillText(`${c.vehicleIds.length}车`, x, y);
+        }
       }
 
       if (anomalies && anomalies.length > 0) {
-        const anomProjected: Array<
-          AnomalyPoint & { x: number; y: number }
-        > = anomalies.map((a) => {
-          const [x, y] = projectPoint(a.lat, a.lng);
-          return { ...a, x, y };
-        });
+        for (const a of anomalies) {
+          if (!isVisible(a.lat, a.lng, 0.003)) continue;
+          const { x, y } = project(a.lat, a.lng);
+          const pulseR = 14 + pulse * 6;
 
-        const anomSel = anomaliesG
-          .selectAll<SVGGElement, (typeof anomProjected)[0]>('g.anomaly')
-          .data(anomProjected, (d) => d.id);
+          context.strokeStyle = 'rgba(255,107,53,0.8)';
+          context.lineWidth = 2;
+          context.beginPath();
+          context.arc(x, y, pulseR, 0, Math.PI * 2);
+          context.stroke();
 
-        const anomEnter = anomSel.enter().append('g').attr('class', 'anomaly');
+          context.fillStyle = 'rgba(255,107,53,0.2)';
+          context.beginPath();
+          context.arc(x, y, 14, 0, Math.PI * 2);
+          context.fill();
 
-        anomEnter
-          .append('circle')
-          .attr('r', 14)
-          .attr('fill', '#ff6b35')
-          .attr('fill-opacity', 0.2)
-          .attr('stroke', '#ff6b35')
-          .attr('stroke-width', 2);
-
-        anomEnter
-          .append('text')
-          .attr('font-size', 14)
-          .attr('text-anchor', 'middle')
-          .attr('dominant-baseline', 'middle')
-          .text('⚠');
-
-        anomSel
-          .merge(anomEnter)
-          .attr('transform', (d) => `translate(${d.x},${d.y})`);
-
-        anomSel.exit().remove();
-      } else {
-        anomaliesG.selectAll('g.anomaly').remove();
+          context.font = '14px sans-serif';
+          context.textAlign = 'center';
+          context.textBaseline = 'middle';
+          context.fillText('⚠', x, y);
+        }
       }
 
+      const markerData: (GPSPoint & { x: number; y: number })[] = [];
+      vehicleTrails.forEach((trail) => {
+        const last = trail[trail.length - 1];
+        if (!last) return;
+        if (filterType !== 'all' && last.type !== filterType) return;
+        if (!isVisible(last.lat, last.lng, 0.003)) return;
+        const { x, y } = project(last.lat, last.lng);
+        markerData.push({ ...last, x, y });
+      });
+
+      for (const d of markerData) {
+        const faded = selectedVehicleId && selectedVehicleId !== d.vehicleId;
+        const markerAlpha = faded ? 0.3 : 1;
+        const color = getVehicleColor(d.type, d.speed);
+        const pulseR = 6 + pulse * 5;
+
+        context.strokeStyle = rgbaFromHex(color, markerAlpha * 0.6);
+        context.lineWidth = 2;
+        context.beginPath();
+        context.arc(d.x, d.y, pulseR, 0, Math.PI * 2);
+        context.stroke();
+
+        context.fillStyle = rgbaFromHex(color, markerAlpha);
+        context.strokeStyle = 'rgba(10,14,26,0.9)';
+        context.lineWidth = 1.5;
+        context.beginPath();
+        context.arc(d.x, d.y, 5, 0, Math.PI * 2);
+        context.fill();
+        context.stroke();
+
+        context.font = '12px sans-serif';
+        context.textAlign = 'center';
+        context.textBaseline = 'middle';
+        context.globalAlpha = markerAlpha;
+        context.fillText(d.type === 'taxi' ? '🚕' : '🚢', d.x, d.y + 1);
+        context.globalAlpha = 1;
+      }
+
+      lastRenderTimeRef.current = t;
       rafRef.current = requestAnimationFrame(render);
     };
 
     rafRef.current = requestAnimationFrame(render);
 
-    const moveHandler = () => {
-      // trigger re-render handled by RAF
+    const hitTest = (clientX: number, clientY) => {
+      const mapInst = mapInstanceRef.current;
+      if (!mapInst) return null;
+      const rect = canvas.getBoundingClientRect();
+      const x = clientX - rect.left;
+      const y = clientY - rect.top;
+      const markerCandidates: { d: GPSPoint & { x: number; y: number }; dist: number }[] = [];
+      vehicleTrails.forEach((trail) => {
+        const last = trail[trail.length - 1];
+        if (!last) return;
+        if (filterType !== 'all' && last.type !== filterType) return;
+        const p = mapInst.latLngToContainerPoint([last.lat, last.lng]);
+        const dx = p.x - x;
+        const dy = p.y - y;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+        if (dist < 14) markerCandidates.push({ d: last, dist });
+      });
+      markerCandidates.sort((a, b) => a.dist - b.dist);
+      return markerCandidates[0]?.d || null;
     };
-    map.on('move', moveHandler);
-    map.on('zoom', moveHandler);
+
+    const clickHandler = (e: MouseEvent) => {
+      const hit = hitTest(e.clientX, e.clientY);
+      if (hit) {
+        selectVehicle(selectedVehicleId === hit.vehicleId ? null : hit.vehicleId);
+      }
+    };
+    canvas.addEventListener('click', clickHandler);
 
     return () => {
       cancelAnimationFrame(rafRef.current);
-      map.off('move', moveHandler);
-      map.off('zoom', moveHandler);
+      canvas.removeEventListener('click', clickHandler);
     };
   }, [vehicleTrails, stats, clusters, anomalies, filterType, selectedVehicleId, selectVehicle]);
 
